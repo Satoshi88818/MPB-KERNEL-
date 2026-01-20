@@ -1,0 +1,129 @@
+import torch
+
+def apply_mixed_precision_rope(
+    q: torch.Tensor,                     # [bs, seq_len_q, num_heads, head_dim] or [seq_len_q, num_heads, head_dim]
+    k: torch.Tensor,                     # [bs, seq_len_k, num_heads, head_dim] or [seq_len_k, num_heads, head_dim]
+    position_ids_q: torch.Tensor,         # [bs, seq_len_q] or [seq_len_q], long
+    position_ids_k: torch.Tensor = None, # Optional: if None, reuse position_ids_q
+    base: float = 10000.0,
+    head_dim: int = 128,
+    high_prec=torch.float64,
+    low_prec=torch.float16,
+    inv_freq: torch.Tensor = None,       # Optional precomputed inv_freq for caching/reuse
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Applies RoPE with mixed-precision bridge for long contexts in low-precision formats.
+    Computes angles and modulo reduction in high precision, then trig + rotation in low precision.
+    Returns rotated q and k in the specified low_prec dtype.
+
+    Cleanups applied:
+    - Removed unused seq_len parameters
+    - Switched to 2 * torch.pi for clarity and speed
+    - Added optional inv_freq caching
+    - Fixed batch squeezing bug (only squeeze if we added a batch dim)
+    - Minor shaping/refactoring improvements
+    """
+    if position_ids_k is None:
+        position_ids_k = position_ids_q
+
+    added_batch = False
+    if q.dim() == 3:
+        added_batch = True
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        position_ids_q = position_ids_q.unsqueeze(0)
+        if position_ids_k is not position_ids_q:  # Was provided separately
+            position_ids_k = position_ids_k.unsqueeze(0)
+
+    bs, seq_q, nh, hd = q.shape
+    _, seq_k, _, _ = k.shape
+    assert hd == head_dim and hd % 2 == 0
+    device = q.device
+
+    if inv_freq is None:
+        arange = torch.arange(0, hd // 2, dtype=high_prec, device=device)
+        exponents = arange / (hd // 2.0)
+        inv_freq = 1.0 / (base ** exponents)  # [hd//2]
+
+    def compute_cos_sin(pos_ids: torch.Tensor):
+        pos_high = pos_ids.unsqueeze(-1).to(high_prec)      # [bs, seq, 1]
+        freqs = inv_freq.unsqueeze(0).unsqueeze(0)         # [1, 1, hd//2]
+        angles = pos_high * freqs                          # [bs, seq, hd//2]
+
+        two_pi = 2 * torch.pi.to(high_prec, device=device)
+        reduced = angles - two_pi * torch.floor(angles / two_pi)
+
+        reduced_low = reduced.to(low_prec)
+        cos = torch.cos(reduced_low).unsqueeze(2)          # [bs, seq, 1, hd//2]
+        sin = torch.sin(reduced_low).unsqueeze(2)
+        return cos, sin
+
+    cos_q, sin_q = compute_cos_sin(position_ids_q)
+    cos_k, sin_k = compute_cos_sin(position_ids_k)
+
+    def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        x1 = x[..., : hd // 2]
+        x2 = x[..., hd // 2 :]
+        out1 = x1 * cos - x2 * sin
+        out2 = x2 * cos + x1 * sin
+        return torch.cat([out1, out2], dim=-1)
+
+    q_rot = rotate(q, cos_q, sin_q)
+    k_rot = rotate(k, cos_k, sin_k)
+
+    if added_batch:
+        q_rot = q_rot.squeeze(0)
+        k_rot = k_rot.squeeze(0)
+
+    return q_rot.to(low_prec), k_rot.to(low_prec)
+
+
+if __name__ == "__main__":
+    # Simple executable demo / test
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}\n")
+
+    batch_size = 1
+    seq_len = 8
+    num_heads = 8
+    head_dim = 128
+    dtype = torch.float16
+
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn_like(q)
+
+    position_ids_q = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+    position_ids_k = position_ids_q + 1_000_000  # Simulate very long context for k
+
+    q_rot, k_rot = apply_mixed_precision_rope(
+        q, k, position_ids_q, position_ids_k, head_dim=head_dim
+    )
+
+    print(f"Output shapes: {q_rot.shape}, {k_rot.shape}")
+    print(f"Output dtype: {q_rot.dtype}\n")
+
+    # Demonstrate why mixed precision matters: compare cos/sin at large position (~1e6)
+    large_pos = torch.tensor([[1_000_000 + seq_len - 1]], device=device)  # [1, 1]
+
+    inv_freq_high = 1.0 / (10000.0 ** (torch.arange(0, head_dim // 2, dtype=torch.float64, device=device) / (head_dim // 2.0)))
+
+    # Pure low-precision (standard RoPE style)
+    angles_low = large_pos.to(dtype) * inv_freq_high.to(dtype)
+    cos_low = torch.cos(angles_low)
+    sin_low = torch.sin(angles_low)
+
+    # Mixed-precision reduction
+    angles_high = large_pos.to(torch.float64) * inv_freq_high
+    two_pi_high = 2 * torch.pi.to(torch.float64, device=device)
+    reduced_high = angles_high - two_pi_high * torch.floor(angles_high / two_pi_high)
+    cos_mixed = torch.cos(reduced_high.to(dtype))
+    sin_mixed = torch.sin(reduced_high.to(dtype))
+
+    print("Demo: cos/sin values for low frequencies (last 8 elements) at position ~1e6")
+    print("Standard (low prec only):")
+    print("  cos:", cos_low[0, 0, -8:].cpu().float().tolist())
+    print("  sin:", sin_low[0, 0, -8:].cpu().float().tolist())
+    print("Mixed-precision:")
+    print("  cos:", cos_mixed[0, 0, -8:].cpu().float().tolist())
+    print("  sin:", sin_mixed[0, 0, -8:].cpu().float().tolist())
+    print("\nNote: Standard version typically collapses to garbage values for low frequencies due to lost fractional precision.")
