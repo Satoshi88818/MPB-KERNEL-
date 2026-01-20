@@ -1,0 +1,49 @@
+# Mixed Precision RoPE Kernel (MPBKernel v1)
+
+A drop-in replacement for standard Rotary Position Embedding (RoPE) that uses mixed precision to maintain accuracy for **very long contexts** when running in low-precision dtypes (e.g., `float16` or `bfloat16`).
+
+## Problem
+
+In standard RoPE implementations, frequencies and angles are computed entirely in the model's dtype. For low-precision formats like `float16`, large position indices (e.g., >100k–1M tokens) cause catastrophic loss of fractional precision in low-frequency components. This results in:
+
+- Cosine/sine values collapsing to garbage (often near-zero or incorrect values) for the lower half of the frequency spectrum.
+- Severe degradation of attention quality in long-context models.
+
+This issue is especially pronounced in `float16` on consumer GPUs and becomes critical in models handling 128k–1M+ token contexts.
+
+## Solution
+
+This kernel uses a **mixed-precision bridge**:
+
+1. Compute inverse frequencies (`inv_freq`) and raw angles in **high precision** (`float64` by default).
+2. Perform the expensive modulo reduction (`angles mod 2π`) in high precision to preserve fractional accuracy.
+3. Cast the reduced angles to low precision only for the final `cos`/`sin` computation and rotation matrix application.
+
+This preserves full angular accuracy for all frequencies while keeping the bulk of the computation (trig + rotation) in the model's fast low-precision dtype.
+
+Key advantages:
+- No accuracy loss even at position IDs >10^7.
+- Minimal overhead (high-precision ops are cheap and small).
+- Fully compatible with existing q/k shapes and batched/unbatched inputs.
+- Optional `inv_freq` caching for repeated calls.
+
+## Usage
+
+Save the function to a file (e.g., `mpb_rope.py`) and import it:
+
+```python
+import torch
+from mpb_rope import apply_mixed_precision_rope
+
+# Example in a transformer attention layer
+q_rot, k_rot = apply_mixed_precision_rope(
+    q,                          # [bs, seq_len_q, num_heads, head_dim] or [seq_len_q, num_heads, head_dim]
+    k,                          # same shape as q but possibly different seq_len_k
+    position_ids_q,             # [bs, seq_len_q] or [seq_len_q]
+    position_ids_k=None,        # optional, defaults to position_ids_q
+    base=10000.0,               # RoPE base (standard for Llama/GPT-NeoX)
+    head_dim=128,               # must match your model
+    high_prec=torch.float64,     # high-precision dtype for angle reduction
+    low_prec=torch.float16,     # target dtype (usually matches model dtype)
+    inv_freq=None,              # optional precomputed inv_freq for caching
+)
